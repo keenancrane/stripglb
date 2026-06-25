@@ -1,0 +1,675 @@
+#!/usr/bin/env python3
+"""stripglb - strip data from a GLB/glTF file, preserving the remaining data as-is.
+
+Removes all non-geometry data (textures, UVs, vertex normals, colors, cameras,
+etc.) by default, keeping only mesh geometry (vertex positions + index
+connectivity). Command-line flags let you keep specific vertex attributes and/or
+texture channels in addition to the geometry, which is always preserved.
+
+The geometry is preserved byte-for-byte: positions, indices, and any kept
+attribute data are copied verbatim, so connectivity and triangulation are never
+altered.
+"""
+
+import base64
+import json
+import os
+import re
+import struct
+import sys
+
+GLB_MAGIC = 0x46546C67  # "glTF"
+CHUNK_JSON = 0x4E4F534A  # "JSON"
+CHUNK_BIN = 0x004E4942   # "BIN\0"
+
+# Map glTF material texture-info slot names to the channel keyword they belong to.
+TEXTURE_SLOT_CHANNELS = {
+    "baseColorTexture": "albedo",
+    "metallicRoughnessTexture": "mr",
+    "normalTexture": "normalmaps",
+    "occlusionTexture": "occlusion",
+    "emissiveTexture": "emission",
+}
+
+USAGE = """\
+usage: stripglb [FLAGS] input.glb [output.glb]
+       stripglb --batch [FLAGS] file1.glb file2.glb ...   (strip each in place)
+       stripglb --batch [FLAGS] input_dir/ output_dir/    (mirror names into dir)
+
+Removes all data except mesh geometry. Without an output path, edits in place.
+In batch mode every file is stripped with the same flags.
+
+Keep flags (geometry is always preserved):
+  --normals       keep vertex normals
+  --uv            keep all texture coordinates
+  --uvN           keep the Nth texture-coordinate set (e.g. --uv0)
+  --color         keep vertex colors
+  --texture       keep all textures (every channel)
+  --albedo        keep albedo (base color) textures
+  --mr            keep metalness-roughness textures
+  --occlusion     keep occlusion textures
+  --emission      keep emission textures
+  --normalmaps    keep normal-map textures
+  --jointsN       keep the Nth joint/bone-index set
+  --weightsN      keep the Nth influence-weight set
+"""
+
+
+class StripError(Exception):
+    pass
+
+
+class KeepSpec:
+    """Describes which attributes/textures to keep (besides geometry)."""
+
+    def __init__(self):
+        self.normals = False
+        self.tangents = False
+        self.colors = False
+        self.all_uv = False
+        self.uv_sets = set()
+        self.all_joints = False
+        self.joint_sets = set()
+        self.all_weights = False
+        self.weight_sets = set()
+        self.all_textures = False
+        self.channels = set()  # subset of {albedo, mr, occlusion, emission, normalmaps}
+
+    def keep_attribute(self, name):
+        """Return True if a primitive attribute by this name should be kept."""
+        if name == "POSITION":
+            return True  # geometry, always kept
+        if name == "NORMAL":
+            return self.normals
+        if name == "TANGENT":
+            return self.tangents
+        if name.startswith("TEXCOORD_"):
+            return self.all_uv or self._index_of(name) in self.uv_sets
+        if name.startswith("COLOR_"):
+            return self.colors
+        if name.startswith("JOINTS_"):
+            return self.all_joints or self._index_of(name) in self.joint_sets
+        if name.startswith("WEIGHTS_"):
+            return self.all_weights or self._index_of(name) in self.weight_sets
+        # Unknown / custom attributes are not geometry: drop them.
+        return False
+
+    @staticmethod
+    def _index_of(name):
+        try:
+            return int(name.rsplit("_", 1)[1])
+        except (IndexError, ValueError):
+            return -1
+
+    def keep_texture_slot(self, slot_name):
+        """Return True if a material texture-info slot should be kept."""
+        if self.all_textures:
+            return True
+        channel = TEXTURE_SLOT_CHANNELS.get(slot_name)
+        if channel is None:
+            return False  # extension / unknown texture slot
+        return channel in self.channels
+
+    def copy(self):
+        clone = KeepSpec()
+        clone.__dict__.update({k: (set(v) if isinstance(v, set) else v)
+                               for k, v in self.__dict__.items()})
+        return clone
+
+
+def parse_args(argv):
+    keep = KeepSpec()
+    positional = []
+    batch = False
+    for arg in argv:
+        if not arg.startswith("--"):
+            positional.append(arg)
+            continue
+        flag = arg[2:]
+        if flag == "batch":
+            batch = True
+        elif flag in ("normal", "normals"):
+            keep.normals = True
+        elif flag in ("tangent", "tangents"):
+            keep.tangents = True
+        elif flag in ("color", "colors"):
+            keep.colors = True
+        elif flag == "texture" or flag == "textures":
+            keep.all_textures = True
+        elif flag == "albedo":
+            keep.channels.add("albedo")
+        elif flag == "mr":
+            keep.channels.add("mr")
+        elif flag == "occlusion":
+            keep.channels.add("occlusion")
+        elif flag == "emission":
+            keep.channels.add("emission")
+        elif flag in ("normalmap", "normalmaps"):
+            keep.channels.add("normalmaps")
+        elif flag == "uv":
+            keep.all_uv = True
+        elif re.fullmatch(r"uv\d+", flag):
+            keep.uv_sets.add(int(flag[2:]))
+        elif flag in ("joint", "joints"):
+            keep.all_joints = True
+        elif re.fullmatch(r"joints?\d+", flag):
+            keep.joint_sets.add(int(re.search(r"\d+", flag).group()))
+        elif flag in ("weight", "weights"):
+            keep.all_weights = True
+        elif re.fullmatch(r"weights?\d+", flag):
+            keep.weight_sets.add(int(re.search(r"\d+", flag).group()))
+        elif flag in ("help", "h"):
+            print(USAGE)
+            sys.exit(0)
+        else:
+            raise StripError("unknown flag: --%s" % flag)
+
+    return keep, batch, positional
+
+
+# --------------------------------------------------------------------------- #
+# GLB / glTF container reading & writing
+# --------------------------------------------------------------------------- #
+
+def read_container(path):
+    """Return (gltf_dict, bin_bytes_or_None, is_glb)."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if len(data) >= 4 and struct.unpack_from("<I", data, 0)[0] == GLB_MAGIC:
+        return read_glb(data) + (True,)
+    # Assume .gltf JSON.
+    gltf = json.loads(data.decode("utf-8"))
+    bin_data = load_external_buffer(gltf, path)
+    return gltf, bin_data, False
+
+
+def read_glb(data):
+    magic, version, total = struct.unpack_from("<III", data, 0)
+    if magic != GLB_MAGIC:
+        raise StripError("not a GLB file (bad magic)")
+    if version != 2:
+        raise StripError("unsupported GLB version: %d" % version)
+    total = min(total, len(data))
+    off = 12
+    gltf = None
+    bin_data = None
+    while off + 8 <= total:
+        clen, ctype = struct.unpack_from("<II", data, off)
+        off += 8
+        chunk = data[off:off + clen]
+        off += clen
+        if ctype == CHUNK_JSON:
+            gltf = json.loads(chunk.decode("utf-8"))
+        elif ctype == CHUNK_BIN:
+            bin_data = chunk
+        # ignore unknown chunk types
+    if gltf is None:
+        raise StripError("GLB has no JSON chunk")
+    return gltf, bin_data
+
+
+def load_external_buffer(gltf, gltf_path):
+    """Load a single embedded/external buffer for a .gltf file (best effort)."""
+    buffers = gltf.get("buffers", [])
+    if not buffers:
+        return None
+    if len(buffers) > 1:
+        raise StripError("multiple external buffers are not supported")
+    uri = buffers[0].get("uri")
+    if uri is None:
+        return None
+    if uri.startswith("data:"):
+        header, b64 = uri.split(",", 1)
+        return base64.b64decode(b64)
+    buf_path = os.path.join(os.path.dirname(os.path.abspath(gltf_path)), uri)
+    with open(buf_path, "rb") as f:
+        return f.read()
+
+
+def write_container(path, gltf, bin_data):
+    """Write GLB, or self-contained glTF JSON if the path ends in .gltf."""
+    if path.lower().endswith(".gltf"):
+        write_gltf(path, gltf, bin_data)
+    else:
+        write_glb(path, gltf, bin_data)
+
+
+def write_gltf(path, gltf, bin_data):
+    out = dict(gltf)
+    if bin_data:
+        uri = "data:application/octet-stream;base64," + \
+            base64.b64encode(bin_data).decode("ascii")
+        out["buffers"] = [{"byteLength": len(bin_data), "uri": uri}]
+    else:
+        out.pop("buffers", None)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(out, f, separators=(",", ":"))
+
+
+def write_glb(path, gltf, bin_data):
+    json_bytes = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
+    json_bytes = pad(json_bytes, b"\x20")
+    chunks = [(CHUNK_JSON, json_bytes)]
+    if bin_data is not None and len(bin_data) > 0:
+        chunks.append((CHUNK_BIN, pad(bin_data, b"\x00")))
+
+    total = 12 + sum(8 + len(c) for _, c in chunks)
+    out = bytearray()
+    out += struct.pack("<III", GLB_MAGIC, 2, total)
+    for ctype, chunk in chunks:
+        out += struct.pack("<II", len(chunk), ctype)
+        out += chunk
+    with open(path, "wb") as f:
+        f.write(out)
+
+
+def pad(data, fill):
+    rem = len(data) % 4
+    if rem:
+        data = data + fill * (4 - rem)
+    return data
+
+
+def align4(n):
+    return (n + 3) & ~3
+
+
+# --------------------------------------------------------------------------- #
+# Stripping
+# --------------------------------------------------------------------------- #
+
+def strip(gltf, bin_data, keep):
+    # Work on a copy so per-file implicit choices below never leak across a
+    # batch run (where one KeepSpec is shared by every file).
+    keep = keep.copy()
+    # A kept texture needs the UV set it samples from, or the material binding
+    # would be invalid. Keep those texcoord sets implicitly.
+    keep.uv_sets |= required_uv_sets(gltf, keep)
+    prune_primitives(gltf, keep)
+    prune_cameras(gltf)
+    prune_material_textures(gltf, keep)
+    prune_textures_images_samplers(gltf)
+    bin_data = repack(gltf, bin_data)
+    clean_extensions(gltf)
+    prune_empty_arrays(gltf)
+    return bin_data
+
+
+def required_uv_sets(gltf, keep):
+    """Texcoord set indices needed by texture slots that will be kept."""
+    needed = set()
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if (key.endswith("Texture") and isinstance(value, dict)
+                        and "index" in value and keep.keep_texture_slot(key)):
+                    needed.add(texcoord_of(value))
+                walk(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    if keep.all_uv:
+        return needed
+    walk(gltf.get("materials", []))
+    return needed
+
+
+def texcoord_of(texture_info):
+    """Effective TEXCOORD set used by a textureInfo (honours KHR_texture_transform)."""
+    transform = texture_info.get("extensions", {}).get("KHR_texture_transform")
+    if isinstance(transform, dict) and "texCoord" in transform:
+        return transform["texCoord"]
+    return texture_info.get("texCoord", 0)
+
+
+def prune_primitives(gltf, keep):
+    for mesh in gltf.get("meshes", []):
+        for prim in mesh.get("primitives", []):
+            attrs = prim.get("attributes", {})
+            prim["attributes"] = {n: v for n, v in attrs.items()
+                                  if keep.keep_attribute(n)}
+            if "targets" in prim:
+                new_targets = []
+                for target in prim["targets"]:
+                    new_targets.append({n: v for n, v in target.items()
+                                        if keep.keep_attribute(n)})
+                prim["targets"] = new_targets
+
+
+def prune_cameras(gltf):
+    gltf.pop("cameras", None)
+    for node in gltf.get("nodes", []):
+        node.pop("camera", None)
+
+
+def prune_material_textures(gltf, keep):
+    """Remove texture-info slots for channels that aren't kept."""
+    for material in gltf.get("materials", []):
+        _prune_texture_infos(material, keep)
+
+
+def _prune_texture_infos(obj, keep):
+    """Recursively drop any *Texture textureInfo dict that isn't kept."""
+    if isinstance(obj, dict):
+        for key in list(obj.keys()):
+            value = obj[key]
+            if key.endswith("Texture") and isinstance(value, dict) and "index" in value:
+                if not keep.keep_texture_slot(key):
+                    del obj[key]
+                    continue
+            _prune_texture_infos(value, keep)
+    elif isinstance(obj, list):
+        for item in obj:
+            _prune_texture_infos(item, keep)
+
+
+def collect_referenced_textures(gltf):
+    refs = set()
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if key.endswith("Texture") and isinstance(value, dict) and "index" in value:
+                    refs.add(value["index"])
+                walk(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(gltf.get("materials", []))
+    return refs
+
+
+def texture_image_refs(texture):
+    """All image indices referenced by a texture (incl. webp/other extensions)."""
+    imgs = []
+    if "source" in texture:
+        imgs.append(texture["source"])
+    for ext in texture.get("extensions", {}).values():
+        if isinstance(ext, dict) and "source" in ext:
+            imgs.append(ext["source"])
+    return imgs
+
+
+def prune_textures_images_samplers(gltf):
+    """Drop textures no longer referenced, then orphaned images & samplers."""
+    textures = gltf.get("textures")
+    if not textures:
+        # No textures: drop any images/samplers too (they can only serve textures).
+        gltf.pop("images", None)
+        gltf.pop("samplers", None)
+        return
+
+    kept_tex = collect_referenced_textures(gltf)
+    tex_map = remap(textures, kept_tex)
+
+    # Figure out which images & samplers the kept textures still need.
+    kept_img = set()
+    kept_samp = set()
+    for i, tex in enumerate(textures):
+        if i not in kept_tex:
+            continue
+        for img in texture_image_refs(tex):
+            kept_img.add(img)
+        if "sampler" in tex:
+            kept_samp.add(tex["sampler"])
+
+    images = gltf.get("images", [])
+    samplers = gltf.get("samplers", [])
+    img_map = remap(images, kept_img)
+    samp_map = remap(samplers, kept_samp)
+
+    # Rebuild texture array and reindex its image/sampler references.
+    new_textures = []
+    for i, tex in enumerate(textures):
+        if i not in kept_tex:
+            continue
+        if "source" in tex:
+            tex["source"] = img_map[tex["source"]]
+        if "sampler" in tex:
+            tex["sampler"] = samp_map[tex["sampler"]]
+        for ext in tex.get("extensions", {}).values():
+            if isinstance(ext, dict) and "source" in ext:
+                ext["source"] = img_map[ext["source"]]
+        new_textures.append(tex)
+    gltf["textures"] = new_textures
+
+    gltf["images"] = [im for i, im in enumerate(images) if i in kept_img]
+    gltf["samplers"] = [s for i, s in enumerate(samplers) if i in kept_samp]
+
+    # Reindex texture references inside materials.
+    for material in gltf.get("materials", []):
+        _reindex_texture_infos(material, tex_map)
+
+
+def _reindex_texture_infos(obj, tex_map):
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key.endswith("Texture") and isinstance(value, dict) and "index" in value:
+                value["index"] = tex_map[value["index"]]
+            _reindex_texture_infos(value, tex_map)
+    elif isinstance(obj, list):
+        for item in obj:
+            _reindex_texture_infos(item, tex_map)
+
+
+def remap(array, kept_indices):
+    """Build old-index -> new-index map for items whose index is in kept_indices."""
+    mapping = {}
+    new_i = 0
+    for old_i in range(len(array)):
+        if old_i in kept_indices:
+            mapping[old_i] = new_i
+            new_i += 1
+    return mapping
+
+
+def repack(gltf, bin_data):
+    """Rebuild the binary buffer with only the bufferViews still in use.
+
+    Bytes of every kept bufferView are copied verbatim, so geometry (and any
+    other kept attribute data) is preserved exactly.
+    """
+    accessors = gltf.get("accessors", [])
+    buffer_views = gltf.get("bufferViews", [])
+
+    # 1. Which accessors are still referenced?
+    kept_acc = set()
+    for mesh in gltf.get("meshes", []):
+        for prim in mesh.get("primitives", []):
+            for acc in prim.get("attributes", {}).values():
+                kept_acc.add(acc)
+            if "indices" in prim:
+                kept_acc.add(prim["indices"])
+            for target in prim.get("targets", []):
+                for acc in target.values():
+                    kept_acc.add(acc)
+    for skin in gltf.get("skins", []):
+        if "inverseBindMatrices" in skin:
+            kept_acc.add(skin["inverseBindMatrices"])
+    for anim in gltf.get("animations", []):
+        for sampler in anim.get("samplers", []):
+            kept_acc.add(sampler["input"])
+            kept_acc.add(sampler["output"])
+
+    # 2. Which bufferViews are still referenced (by kept accessors or images)?
+    kept_bv = set()
+    for i in kept_acc:
+        bv = accessors[i].get("bufferView")
+        if bv is not None:
+            kept_bv.add(bv)
+    for image in gltf.get("images", []):
+        if "bufferView" in image:
+            kept_bv.add(image["bufferView"])
+
+    acc_map = remap(accessors, kept_acc)
+    bv_map = remap(buffer_views, kept_bv)
+
+    # 3. Rebuild the binary buffer from kept bufferViews (verbatim copies).
+    new_bin = bytearray()
+    new_buffer_views = []
+    for old_i in range(len(buffer_views)):
+        if old_i not in kept_bv:
+            continue
+        bv = dict(buffer_views[old_i])
+        start = bv.get("byteOffset", 0)
+        length = bv["byteLength"]
+        if bin_data is None:
+            raise StripError("buffer data is missing; cannot repack")
+        segment = bin_data[start:start + length]
+
+        new_offset = align4(len(new_bin))
+        new_bin.extend(b"\x00" * (new_offset - len(new_bin)))
+        new_bin.extend(segment)
+
+        bv["byteOffset"] = new_offset
+        bv["buffer"] = 0
+        new_buffer_views.append(bv)
+
+    # 4. Rebuild accessor array & reindex bufferView references.
+    new_accessors = []
+    for old_i in range(len(accessors)):
+        if old_i not in kept_acc:
+            continue
+        acc = dict(accessors[old_i])
+        if "bufferView" in acc and acc["bufferView"] is not None:
+            acc["bufferView"] = bv_map[acc["bufferView"]]
+        new_accessors.append(acc)
+
+    # 5. Reindex everything that points at accessors / bufferViews.
+    for mesh in gltf.get("meshes", []):
+        for prim in mesh.get("primitives", []):
+            prim["attributes"] = {n: acc_map[a]
+                                  for n, a in prim.get("attributes", {}).items()}
+            if "indices" in prim:
+                prim["indices"] = acc_map[prim["indices"]]
+            if "targets" in prim:
+                prim["targets"] = [{n: acc_map[a] for n, a in t.items()}
+                                   for t in prim["targets"]]
+    for skin in gltf.get("skins", []):
+        if "inverseBindMatrices" in skin:
+            skin["inverseBindMatrices"] = acc_map[skin["inverseBindMatrices"]]
+    for anim in gltf.get("animations", []):
+        for sampler in anim.get("samplers", []):
+            sampler["input"] = acc_map[sampler["input"]]
+            sampler["output"] = acc_map[sampler["output"]]
+    for image in gltf.get("images", []):
+        if "bufferView" in image:
+            image["bufferView"] = bv_map[image["bufferView"]]
+
+    gltf["accessors"] = new_accessors
+    gltf["bufferViews"] = new_buffer_views
+
+    new_bin = bytes(new_bin)
+    if new_bin:
+        gltf["buffers"] = [{"byteLength": len(new_bin)}]
+    else:
+        gltf.pop("buffers", None)
+    return new_bin
+
+
+def clean_extensions(gltf):
+    """Drop extension names that are no longer referenced anywhere."""
+    used = set()
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            exts = obj.get("extensions")
+            if isinstance(exts, dict):
+                used.update(exts.keys())
+            for value in obj.values():
+                walk(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    # Don't count the top-level declaration lists themselves.
+    scan = {k: v for k, v in gltf.items()
+            if k not in ("extensionsUsed", "extensionsRequired")}
+    walk(scan)
+
+    for key in ("extensionsUsed", "extensionsRequired"):
+        if key in gltf:
+            filtered = [e for e in gltf[key] if e in used]
+            if filtered:
+                gltf[key] = filtered
+            else:
+                del gltf[key]
+
+
+def prune_empty_arrays(gltf):
+    for key in ("images", "textures", "samplers", "materials", "skins",
+                "animations", "accessors", "bufferViews"):
+        if key in gltf and not gltf[key]:
+            del gltf[key]
+
+
+def process_file(keep, in_path, out_path):
+    gltf, bin_data, _is_glb = read_container(in_path)
+    bin_data = strip(gltf, bin_data, keep)
+    write_container(out_path, gltf, bin_data)
+
+
+MODEL_EXTS = (".glb", ".gltf")
+
+
+def batch_tasks(positional):
+    """Return a list of (in_path, out_path) pairs for batch mode."""
+    if not positional:
+        raise StripError("batch mode needs files, or an input and output "
+                         "directory\n\n" + USAGE)
+    if os.path.isdir(positional[0]):
+        if len(positional) != 2:
+            raise StripError("directory batch mode takes exactly an input "
+                             "and an output directory")
+        in_dir, out_dir = positional
+        names = sorted(n for n in os.listdir(in_dir)
+                       if n.lower().endswith(MODEL_EXTS)
+                       and os.path.isfile(os.path.join(in_dir, n)))
+        if not names:
+            raise StripError("no .glb/.gltf files found in %s" % in_dir)
+        os.makedirs(out_dir, exist_ok=True)
+        return [(os.path.join(in_dir, n), os.path.join(out_dir, n)) for n in names]
+    # Otherwise: a list of files, stripped in place.
+    return [(p, p) for p in positional]
+
+
+def run_batch(keep, positional):
+    tasks = batch_tasks(positional)
+    failures = 0
+    for in_path, out_path in tasks:
+        try:
+            process_file(keep, in_path, out_path)
+            sys.stderr.write("stripped %s -> %s\n" % (in_path, out_path))
+        except (StripError, OSError, ValueError) as e:
+            failures += 1
+            sys.stderr.write("stripglb: failed on %s: %s\n" % (in_path, e))
+    if failures:
+        sys.stderr.write("stripglb: %d of %d file(s) failed\n"
+                         % (failures, len(tasks)))
+        return 1
+    return 0
+
+
+def main(argv):
+    try:
+        keep, batch, positional = parse_args(argv)
+        if batch:
+            return run_batch(keep, positional)
+        if not positional:
+            raise StripError("no input file given\n\n" + USAGE)
+        if len(positional) > 2:
+            raise StripError("too many positional arguments (use --batch?)")
+        in_path = positional[0]
+        out_path = positional[1] if len(positional) == 2 else positional[0]
+        process_file(keep, in_path, out_path)
+    except StripError as e:
+        sys.stderr.write("stripglb: %s\n" % e)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
